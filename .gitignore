@@ -1,0 +1,20 @@
+# Build output directory
+output/
+
+# Buildroot source (clone separately or use as submodule)
+buildroot/
+
+# OS artifacts
+*.img
+*.o
+*.a
+*.ko
+*.so
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

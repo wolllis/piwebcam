@@ -1,0 +1,219 @@
+#!/bin/sh
+#
+# S99uvc-webcam - UVC gadget init script
+# Configures USB gadget via configfs and launches uvc-gadget
+# to bridge the IMX477 camera to the UVC function.
+#
+
+# Configuration
+VIDEO_DEV="/dev/video0"
+GADGET_DIR="/sys/kernel/config/usb_gadget/g1"
+UVC_FUNC_NAME=""
+VID="0x1d6b"    # Linux Foundation
+PID="0x0102"    # UVC gadget
+SERIAL="0000000001"
+MANUFACTURER="Raspberry Pi Foundation"
+PRODUCT="RPi Zero 2 W UVC Webcam"
+CONFIG_STRING="UVC"
+MAX_SPEED="high-speed"
+UDC_UDC_DIR="/sys/class/udc"
+
+safe_link() {
+    src="$1"
+    dst="$2"
+    rm -f "$dst"
+    ln -s "$src" "$dst"
+}
+
+teardown_gadget() {
+    [ -d "$GADGET_DIR" ] || return 0
+
+    # Unbind first (truncate to zero bytes, do not write a newline)
+    : > "$GADGET_DIR/UDC" 2>/dev/null || true
+
+    # Remove config symlink if present
+    [ -n "$UVC_FUNC_NAME" ] && rm -f "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME" 2>/dev/null || true
+
+    # Remove gadget tree to avoid stale/partial configfs state
+    rm -rf "$GADGET_DIR" 2>/dev/null || true
+}
+
+create_uvc_function() {
+    for name in uvc.usb0 uvc.0; do
+        if mkdir -p "$GADGET_DIR/functions/$name" 2>/dev/null; then
+            UVC_FUNC_NAME="$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
+start() {
+    modprobe libcomposite >/dev/null 2>&1 || true
+    modprobe usb_f_uvc >/dev/null 2>&1 || true
+
+    printf "Loading camera modules... "
+    modprobe bcm2835-unicam 2>/dev/null && printf "bcm2835-unicam OK " || printf "bcm2835-unicam SKIP "
+    modprobe imx477 2>/dev/null && printf "imx477 OK\n" || printf "imx477 SKIP\n"
+
+    # Wait for camera device
+    printf "Waiting for camera..."
+    for i in $(seq 10); do
+        [ -c /dev/video0 ] && break
+        sleep 1
+        printf "."
+    done
+    printf "\n"
+
+    printf "Configuring UVC gadget... "
+
+    # Mount configfs if not mounted
+    mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
+
+    # Check if already configured (and actually bound)
+    if [ -d "$GADGET_DIR" ] && [ -n "$(cat "$GADGET_DIR/UDC" 2>/dev/null)" ]; then
+        printf "already configured\n"
+        return 0
+    fi
+
+    # Recover from stale/invalid gadget state left by previous failed boots
+    teardown_gadget
+
+    # Create gadget
+    mkdir -p "$GADGET_DIR"
+    mkdir -p "$GADGET_DIR/functions"
+    echo "$VID" > "$GADGET_DIR/idVendor"
+    echo "$PID" > "$GADGET_DIR/idProduct"
+    echo "$MAX_SPEED" > "$GADGET_DIR/max_speed"
+
+    # Serial number, manufacturer, product strings
+    mkdir -p "$GADGET_DIR/strings/0x409"
+    echo "$SERIAL" > "$GADGET_DIR/strings/0x409/serialnumber"
+    echo "$MANUFACTURER" > "$GADGET_DIR/strings/0x409/manufacturer"
+    echo "$PRODUCT" > "$GADGET_DIR/strings/0x409/product"
+
+    # Create config
+    mkdir -p "$GADGET_DIR/configs/c.1"
+    mkdir -p "$GADGET_DIR/configs/c.1/strings/0x409"
+    echo "$CONFIG_STRING" > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
+    echo 120 > "$GADGET_DIR/configs/c.1/MaxPower"
+
+    # Create UVC function (kernel naming differs across versions)
+    create_uvc_function || {
+        printf "FAILED: cannot create UVC function (tried uvc.usb0 and uvc.0)\n"
+        printf "HINT: usb_f_uvc may be unavailable for the running kernel\n"
+        return 1
+    }
+
+    # Configure UVC control descriptors
+    UVC_FUNC="$GADGET_DIR/functions/$UVC_FUNC_NAME"
+
+    mkdir -p "$UVC_FUNC/control/header/h"
+    mkdir -p "$UVC_FUNC/control/class/fs"
+    mkdir -p "$UVC_FUNC/control/class/hs"
+    safe_link ../../header/h "$UVC_FUNC/control/class/fs/h"
+    safe_link ../../header/h "$UVC_FUNC/control/class/hs/h"
+
+    # DWC2 on Pi Zero 2 W supports USB 2.0 (FS/HS), not SuperSpeed
+    echo 1023 > "$UVC_FUNC/streaming_maxpacket"
+
+    # Configure UVC streaming descriptors
+
+    # Format: YUYV (uncompressed)
+    mkdir -p "$UVC_FUNC/streaming/uncompressed/u/1"
+    echo 1920 > "$UVC_FUNC/streaming/uncompressed/u/1/wWidth"
+    echo 1080 > "$UVC_FUNC/streaming/uncompressed/u/1/wHeight"
+    echo 4147200 > "$UVC_FUNC/streaming/uncompressed/u/1/dwMaxVideoFrameBufferSize"
+    echo 333333 > "$UVC_FUNC/streaming/uncompressed/u/1/dwDefaultFrameInterval"
+    echo 1 > "$UVC_FUNC/streaming/uncompressed/u/1/bFrameIntervalType"
+    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/uncompressed/u/1/dwFrameInterval"
+
+    # Format: YUYV 1280x720
+    mkdir -p "$UVC_FUNC/streaming/uncompressed/u/2"
+    echo 1280 > "$UVC_FUNC/streaming/uncompressed/u/2/wWidth"
+    echo 720 > "$UVC_FUNC/streaming/uncompressed/u/2/wHeight"
+    echo 1843200 > "$UVC_FUNC/streaming/uncompressed/u/2/dwMaxVideoFrameBufferSize"
+    echo 333333 > "$UVC_FUNC/streaming/uncompressed/u/2/dwDefaultFrameInterval"
+    echo 1 > "$UVC_FUNC/streaming/uncompressed/u/2/bFrameIntervalType"
+    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/uncompressed/u/2/dwFrameInterval"
+
+    # Format: MJPEG
+    mkdir -p "$UVC_FUNC/streaming/mjpeg/m/1"
+    echo 1920 > "$UVC_FUNC/streaming/mjpeg/m/1/wWidth"
+    echo 1080 > "$UVC_FUNC/streaming/mjpeg/m/1/wHeight"
+    echo 4147200 > "$UVC_FUNC/streaming/mjpeg/m/1/dwMaxVideoFrameBufferSize"
+    echo 333333 > "$UVC_FUNC/streaming/mjpeg/m/1/dwDefaultFrameInterval"
+    echo 1 > "$UVC_FUNC/streaming/mjpeg/m/1/bFrameIntervalType"
+    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/mjpeg/m/1/dwFrameInterval"
+
+    # Format: MJPEG 1280x720
+    mkdir -p "$UVC_FUNC/streaming/mjpeg/m/2"
+    echo 1280 > "$UVC_FUNC/streaming/mjpeg/m/2/wWidth"
+    echo 720 > "$UVC_FUNC/streaming/mjpeg/m/2/wHeight"
+    echo 1843200 > "$UVC_FUNC/streaming/mjpeg/m/2/dwMaxVideoFrameBufferSize"
+    echo 333333 > "$UVC_FUNC/streaming/mjpeg/m/2/dwDefaultFrameInterval"
+    echo 1 > "$UVC_FUNC/streaming/mjpeg/m/2/bFrameIntervalType"
+    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/mjpeg/m/2/dwFrameInterval"
+
+    # Header descriptors and class links
+    mkdir -p "$UVC_FUNC/streaming/header/h"
+    mkdir -p "$UVC_FUNC/streaming/class/fs"
+    mkdir -p "$UVC_FUNC/streaming/class/hs"
+    safe_link ../../uncompressed/u "$UVC_FUNC/streaming/header/h/u"
+    safe_link ../../mjpeg/m "$UVC_FUNC/streaming/header/h/m"
+    safe_link ../../header/h "$UVC_FUNC/streaming/class/fs/h"
+    safe_link ../../header/h "$UVC_FUNC/streaming/class/hs/h"
+
+    # Link function to config
+    safe_link ../../functions/$UVC_FUNC_NAME "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME"
+
+    # Enable gadget
+    UDC=$(ls "$UDC_UDC_DIR" 2>/dev/null | head -1)
+    if [ -n "$UDC" ]; then
+        echo "$UDC" > "$GADGET_DIR/UDC"
+        printf "done (UDC: %s)\n" "$UDC"
+    else
+        printf "FAILED: no UDC found\n"
+        return 1
+    fi
+
+    # Launch uvc-gadget (bridge camera to UVC function)
+    printf "Starting uvc-gadget... "
+    uvc-gadget -d "$VIDEO_DEV" "g1/functions/$UVC_FUNC_NAME" &
+    printf "pid %d\n" $!
+    return 0
+}
+
+stop() {
+    printf "Stopping uvc-gadget... "
+    killall uvc-gadget 2>/dev/null
+    printf "done\n"
+
+    printf "Disabling UVC gadget... "
+    teardown_gadget
+    printf "done\n"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart|reload)
+        restart
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit $?

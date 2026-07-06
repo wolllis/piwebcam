@@ -1,0 +1,11 @@
+config BR2_PACKAGE_UVC_GADGET
+	bool "uvc-gadget"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_LIBEVENT
+	help
+	  UVC gadget userspace sample application.
+	  Bridges camera frames from a V4L2 device to a UVC gadget
+	  function, making the board enumerate as a USB webcam.
+
+	  https://git.ideasonboard.org/uvc-gadget.git

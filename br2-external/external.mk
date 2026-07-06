@@ -1,0 +1,1 @@
+include $(sort $(wildcard $(BR2_EXTERNAL_RPI2W_WEBCAM_PATH)/package/*/*.mk))
