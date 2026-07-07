@@ -14,8 +14,9 @@ gpu_mem_256=100
 gpu_mem_512=100
 gpu_mem_1024=100
 
-# Enable camera interface
-camera_auto_detect=1
+# Camera interface: the sensor is described explicitly via dtoverlay=imx477
+# below, so disable firmware auto-detection to avoid a conflicting overlay.
+camera_auto_detect=0
 
 # CMA size for camera buffers (matches kernel CONFIG_CMA_SIZE_MBYTES=256)
 dtoverlay=vc4-kms-v3d,cma-256

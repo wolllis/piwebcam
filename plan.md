@@ -72,6 +72,9 @@ Build a minimal Buildroot-based Linux image for a Raspberry Pi that boots, captu
 ### dwc_otg vs dwc2 conflict
 The Raspberry Pi kernel fork uses `dwc_otg` (proprietary host-only driver) which claims the USB controller before dwc2 can bind in peripheral mode. The `dtoverlay=dwc2,dr_mode=peripheral` in config.txt should swap the driver at boot. This works on standard Raspberry Pi OS but hasn't been verified with Buildroot.
 
+### UVC configfs class link semantics (resolved)
+On this kernel, UVC class paths such as `control/class/fs` and `streaming/class/fs|hs|ss` behave as directories in configfs, not replaceable symlink nodes. Attempting to remove them (`rm -rf`) can fail with "Operation not permitted" and linking directly to those paths can fail at runtime. The working layout is to create links inside those directories (`.../class/fs/h`, `.../class/hs/h`, `.../class/ss/h`) pointing to the header node.
+
 ### Camera drivers as modules
 `bcm2835-unicam` and `imx477` are modules (=m) because MEDIA_SUPPORT=m forces them. They're loaded by S99uvc-webcam at boot. The `camera_auto_detect=1` in config.txt may not work without the firmware sensor autodetection path — the init script handles this explicitly.
 

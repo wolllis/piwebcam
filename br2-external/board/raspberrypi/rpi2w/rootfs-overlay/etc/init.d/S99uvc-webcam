@@ -1,12 +1,14 @@
 #!/bin/sh
 #
 # S99uvc-webcam - UVC gadget init script
-# Configures USB gadget via configfs and launches uvc-gadget
-# to bridge the IMX477 camera to the UVC function.
+# Configures a USB UVC gadget via configfs and launches uvc-gadget to bridge
+# the IMX477 camera (or a test pattern) to the UVC function so the board
+# enumerates as a standard USB webcam on the host.
 #
 
 # Configuration
-VIDEO_DEV="/dev/video0"
+CAMERA_DEV=""
+USE_TEST_SOURCE=0
 GADGET_DIR="/sys/kernel/config/usb_gadget/g1"
 UVC_FUNC_NAME=""
 VID="0x1d6b"    # Linux Foundation
@@ -16,28 +18,100 @@ MANUFACTURER="Raspberry Pi Foundation"
 PRODUCT="RPi Zero 2 W UVC Webcam"
 CONFIG_STRING="UVC"
 MAX_SPEED="high-speed"
-UDC_UDC_DIR="/sys/class/udc"
+UDC_DIR="/sys/class/udc"
 
+# Frame descriptors advertised to the host, one per line:
+#   "<format> <index> <width> <height> <maxframebuffer> <frameinterval>"
+# frameinterval is in 100 ns units (333333 = 30 fps).
+UVC_FRAMES="
+uncompressed 1 1920 1080 4147200 333333
+uncompressed 2 1280 720  1843200 333333
+mjpeg        1 1920 1080 4147200 333333
+mjpeg        2 1280 720  1843200 333333
+"
+
+# log MESSAGE - print an informational message to stdout.
+log() {
+    printf '%s\n' "$*"
+}
+
+# warn MESSAGE - print a warning message to stdout.
+warn() {
+    printf 'WARN: %s\n' "$*"
+}
+
+# safe_link SRC DST - (re)create symlink DST -> SRC, creating parent dirs and
+# removing any stale link first. Returns the ln exit status.
 safe_link() {
     src="$1"
     dst="$2"
+    parent_dir=$(dirname "$dst")
+    mkdir -p "$parent_dir" 2>/dev/null || true
     rm -f "$dst"
     ln -s "$src" "$dst"
 }
 
+# link_uvc_class CLASS_ROOT SPEED [HEADER_NODE] - link the speed-specific class
+# entry (e.g. control/class/fs) to the header node. Handles kernels where the
+# class entry is a directory (link inside it) or a replaceable symlink node.
+link_uvc_class() {
+    class_root="$1"
+    speed="$2"
+    header_node="${3:-header/h}"
+    header_path="$class_root/$header_node"
+    class_entry="$class_root/class/$speed"
+
+    # Kernel layouts differ: class/<speed> may be a directory or a symlink node.
+    if [ -d "$class_entry" ]; then
+        safe_link "$header_path" "$class_entry/h"
+    else
+        safe_link "$header_path" "$class_entry"
+    fi
+}
+
+# create_streaming_header_links STREAM_ROOT - link the uncompressed (u) and
+# mjpeg (m) format descriptors under the streaming header. Prints the header
+# node path used ("header/h" or "header") and returns 0 on success.
+create_streaming_header_links() {
+    stream_root="$1"
+
+    mkdir -p "$stream_root/header/h" 2>/dev/null || true
+    if [ -d "$stream_root/header/h" ]; then
+        safe_link "$stream_root/uncompressed/u" "$stream_root/header/h/u" || return 1
+        safe_link "$stream_root/mjpeg/m" "$stream_root/header/h/m" || return 1
+        echo "header/h"
+        return 0
+    fi
+
+    # Fallback for kernels where header itself is used as the link anchor.
+    mkdir -p "$stream_root/header" || return 1
+    safe_link "$stream_root/uncompressed/u" "$stream_root/header/u" || return 1
+    safe_link "$stream_root/mjpeg/m" "$stream_root/header/m" || return 1
+    echo "header"
+    return 0
+}
+
+# teardown_gadget - fully dismantle the configfs gadget tree.
+# configfs does not allow unlinking attribute files, so the tree must be
+# removed in order: unbind the UDC, delete every symlink (function and class
+# links), then rmdir the directories deepest-first (attributes vanish with
+# their directory). This also recovers from stale state left by a prior boot.
 teardown_gadget() {
     [ -d "$GADGET_DIR" ] || return 0
 
-    # Unbind first (truncate to zero bytes, do not write a newline)
-    : > "$GADGET_DIR/UDC" 2>/dev/null || true
+    # Unbind from the UDC (an empty write, not a zero-byte truncate).
+    echo "" > "$GADGET_DIR/UDC" 2>/dev/null || true
 
-    # Remove config symlink if present
-    [ -n "$UVC_FUNC_NAME" ] && rm -f "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME" 2>/dev/null || true
+    # Remove all symlinks (config function links + UVC class links).
+    find "$GADGET_DIR" -type l -exec rm -f {} + 2>/dev/null || true
 
-    # Remove gadget tree to avoid stale/partial configfs state
-    rm -rf "$GADGET_DIR" 2>/dev/null || true
+    # Remove directories deepest-first; attribute files disappear with them.
+    find "$GADGET_DIR" -depth -type d -exec rmdir {} + 2>/dev/null || true
 }
 
+# create_uvc_function - create the UVC function directory, trying the naming
+# variants used by different kernels. Sets UVC_FUNC_NAME and returns 0 on
+# success, 1 if neither variant can be created.
 create_uvc_function() {
     for name in uvc.usb0 uvc.0; do
         if mkdir -p "$GADGET_DIR/functions/$name" 2>/dev/null; then
@@ -48,22 +122,112 @@ create_uvc_function() {
     return 1
 }
 
+# detect_camera_dev - print the /dev/videoN capture node for the CSI camera.
+# Skips UVC gadget nodes; prefers a node whose name matches a known camera
+# (unicam/imx/bcm2835/camera), otherwise falls back to the first non-gadget
+# node. Prints the node path and returns 0 on success, 1 if none found.
+detect_camera_dev() {
+    fallback=""
+
+    for sysdev in /sys/class/video4linux/video*; do
+        [ -e "$sysdev" ] || continue
+
+        node="/dev/$(basename "$sysdev")"
+        [ -c "$node" ] || continue
+
+        name=""
+        [ -r "$sysdev/name" ] && name=$(cat "$sysdev/name" 2>/dev/null)
+
+        case "$name" in
+            *gadget*|*Gadget*|*uvc*|*UVC*)
+                continue
+                ;;
+            *unicam*|*Unicam*|*imx*|*IMX*|*bcm2835*|*camera*|*Camera*)
+                echo "$node"
+                return 0
+                ;;
+        esac
+
+        # Remember the first non-gadget node as a fallback.
+        [ -z "$fallback" ] && fallback="$node"
+    done
+
+    if [ -n "$fallback" ]; then
+        echo "$fallback"
+        return 0
+    fi
+
+    return 1
+}
+
+# start - load camera + gadget modules, detect the camera (or fall back to a
+# test pattern), build the UVC gadget in configfs, bind it to the UDC, and
+# launch uvc-gadget to stream frames to the host.
 start() {
-    modprobe libcomposite >/dev/null 2>&1 || true
-    modprobe usb_f_uvc >/dev/null 2>&1 || true
+    if ! modprobe libcomposite >/dev/null 2>&1; then
+        warn "modprobe libcomposite failed"
+    fi
+    if ! modprobe usb_f_uvc >/dev/null 2>&1; then
+        warn "modprobe usb_f_uvc failed (may be auto-loaded with the function)"
+    fi
 
     printf "Loading camera modules... "
-    modprobe bcm2835-unicam 2>/dev/null && printf "bcm2835-unicam OK " || printf "bcm2835-unicam SKIP "
-    modprobe imx477 2>/dev/null && printf "imx477 OK\n" || printf "imx477 SKIP\n"
+    # The IMX477 + unicam graph needs i2c-mux + V4L2 async dependencies first.
+    for dep in i2c-mux i2c-mux-pinctrl v4l2-fwnode v4l2-async; do
+        if modprobe "$dep" >/dev/null 2>&1; then
+            printf "%s OK " "$dep"
+        else
+            printf "%s SKIP " "$dep"
+        fi
+    done
+    if modprobe bcm2835-unicam >/dev/null 2>&1; then
+        printf "bcm2835-unicam OK "
+    else
+        printf "bcm2835-unicam SKIP "
+        modprobe bcm2835-unicam 2>&1 | sed 's/^/  /'
+    fi
+    if modprobe imx477 >/dev/null 2>&1; then
+        printf "imx477 OK\n"
+    else
+        printf "imx477 SKIP\n"
+        modprobe imx477 2>&1 | sed 's/^/  /'
+    fi
 
-    # Wait for camera device
+    # Wait for camera device and pin the actual capture node before binding UVC.
     printf "Waiting for camera..."
-    for i in $(seq 10); do
-        [ -c /dev/video0 ] && break
+    for i in $(seq 15); do
+        CAMERA_DEV=$(detect_camera_dev)
+        [ -n "$CAMERA_DEV" ] && break
         sleep 1
         printf "."
     done
     printf "\n"
+
+    if [ -z "$CAMERA_DEV" ]; then
+        printf "WARN: no non-gadget V4L2 camera node found via unicam/imx477 path\n"
+        printf "Trying legacy camera stack (bcm2835-v4l2)... "
+        if modprobe bcm2835-v4l2 >/dev/null 2>&1; then
+            printf "loaded\n"
+        else
+            printf "not available\n"
+        fi
+
+        printf "Waiting for legacy camera node..."
+        for i in $(seq 10); do
+            CAMERA_DEV=$(detect_camera_dev)
+            [ -n "$CAMERA_DEV" ] && break
+            sleep 1
+            printf "."
+        done
+        printf "\n"
+
+        if [ -z "$CAMERA_DEV" ]; then
+            printf "WARN: no non-gadget V4L2 camera node found, falling back to test source\n"
+            ls -l /sys/class/video4linux 2>&1 | sed 's/^/  /'
+            ls -l /sys/bus/i2c/devices 2>&1 | sed 's/^/  /'
+            USE_TEST_SOURCE=1
+        fi
+    fi
 
     printf "Configuring UVC gadget... "
 
@@ -102,73 +266,61 @@ start() {
     create_uvc_function || {
         printf "FAILED: cannot create UVC function (tried uvc.usb0 and uvc.0)\n"
         printf "HINT: usb_f_uvc may be unavailable for the running kernel\n"
+        printf "DEBUG: uname -r=%s\n" "$(uname -r)"
+        printf "DEBUG: module path /lib/modules/%s\n" "$(uname -r)"
+        ls -ld "/lib/modules/$(uname -r)" 2>&1 | sed 's/^/  /'
+        ls "/lib/modules/$(uname -r)/kernel/drivers/usb/gadget/function" 2>&1 | sed 's/^/  /'
         return 1
     }
 
     # Configure UVC control descriptors
     UVC_FUNC="$GADGET_DIR/functions/$UVC_FUNC_NAME"
 
-    mkdir -p "$UVC_FUNC/control/header/h"
-    mkdir -p "$UVC_FUNC/control/class/fs"
-    mkdir -p "$UVC_FUNC/control/class/hs"
-    safe_link ../../header/h "$UVC_FUNC/control/class/fs/h"
-    safe_link ../../header/h "$UVC_FUNC/control/class/hs/h"
+    mkdir -p "$UVC_FUNC/control/header/h" || return 1
+    mkdir -p "$UVC_FUNC/control/class" || return 1
+    link_uvc_class "$UVC_FUNC/control" fs || return 1
+    link_uvc_class "$UVC_FUNC/control" ss || return 1
 
-    # DWC2 on Pi Zero 2 W supports USB 2.0 (FS/HS), not SuperSpeed
-    echo 1023 > "$UVC_FUNC/streaming_maxpacket"
+    # DWC2 on Pi Zero 2 W supports USB 2.0 (FS/HS), not SuperSpeed.
+    # 3072 = 3 packets/microframe (high-speed isochronous) for the bandwidth
+    # needed by 720p/1080p MJPEG; 1023 (full-speed) starves the endpoint and
+    # causes "VS request completed with status -61".
+    echo 3072 > "$UVC_FUNC/streaming_maxpacket"
 
-    # Configure UVC streaming descriptors
-
-    # Format: YUYV (uncompressed)
-    mkdir -p "$UVC_FUNC/streaming/uncompressed/u/1"
-    echo 1920 > "$UVC_FUNC/streaming/uncompressed/u/1/wWidth"
-    echo 1080 > "$UVC_FUNC/streaming/uncompressed/u/1/wHeight"
-    echo 4147200 > "$UVC_FUNC/streaming/uncompressed/u/1/dwMaxVideoFrameBufferSize"
-    echo 333333 > "$UVC_FUNC/streaming/uncompressed/u/1/dwDefaultFrameInterval"
-    echo 1 > "$UVC_FUNC/streaming/uncompressed/u/1/bFrameIntervalType"
-    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/uncompressed/u/1/dwFrameInterval"
-
-    # Format: YUYV 1280x720
-    mkdir -p "$UVC_FUNC/streaming/uncompressed/u/2"
-    echo 1280 > "$UVC_FUNC/streaming/uncompressed/u/2/wWidth"
-    echo 720 > "$UVC_FUNC/streaming/uncompressed/u/2/wHeight"
-    echo 1843200 > "$UVC_FUNC/streaming/uncompressed/u/2/dwMaxVideoFrameBufferSize"
-    echo 333333 > "$UVC_FUNC/streaming/uncompressed/u/2/dwDefaultFrameInterval"
-    echo 1 > "$UVC_FUNC/streaming/uncompressed/u/2/bFrameIntervalType"
-    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/uncompressed/u/2/dwFrameInterval"
-
-    # Format: MJPEG
-    mkdir -p "$UVC_FUNC/streaming/mjpeg/m/1"
-    echo 1920 > "$UVC_FUNC/streaming/mjpeg/m/1/wWidth"
-    echo 1080 > "$UVC_FUNC/streaming/mjpeg/m/1/wHeight"
-    echo 4147200 > "$UVC_FUNC/streaming/mjpeg/m/1/dwMaxVideoFrameBufferSize"
-    echo 333333 > "$UVC_FUNC/streaming/mjpeg/m/1/dwDefaultFrameInterval"
-    echo 1 > "$UVC_FUNC/streaming/mjpeg/m/1/bFrameIntervalType"
-    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/mjpeg/m/1/dwFrameInterval"
-
-    # Format: MJPEG 1280x720
-    mkdir -p "$UVC_FUNC/streaming/mjpeg/m/2"
-    echo 1280 > "$UVC_FUNC/streaming/mjpeg/m/2/wWidth"
-    echo 720 > "$UVC_FUNC/streaming/mjpeg/m/2/wHeight"
-    echo 1843200 > "$UVC_FUNC/streaming/mjpeg/m/2/dwMaxVideoFrameBufferSize"
-    echo 333333 > "$UVC_FUNC/streaming/mjpeg/m/2/dwDefaultFrameInterval"
-    echo 1 > "$UVC_FUNC/streaming/mjpeg/m/2/bFrameIntervalType"
-    echo 333333 666666 1000000 > "$UVC_FUNC/streaming/mjpeg/m/2/dwFrameInterval"
+    # Configure UVC streaming descriptors (see UVC_FRAMES table above).
+    echo "$UVC_FRAMES" | while read -r fmt idx w h buf interval; do
+        [ -n "$fmt" ] || continue
+        case "$fmt" in
+            uncompressed) frame_dir="$UVC_FUNC/streaming/uncompressed/u/$idx" ;;
+            mjpeg)        frame_dir="$UVC_FUNC/streaming/mjpeg/m/$idx" ;;
+            *)            continue ;;
+        esac
+        mkdir -p "$frame_dir" || exit 1
+        echo "$w" > "$frame_dir/wWidth"
+        echo "$h" > "$frame_dir/wHeight"
+        echo "$buf" > "$frame_dir/dwMaxVideoFrameBufferSize"
+        echo "$interval" > "$frame_dir/dwDefaultFrameInterval"
+        echo "$interval" > "$frame_dir/dwFrameInterval"
+    done || return 1
 
     # Header descriptors and class links
-    mkdir -p "$UVC_FUNC/streaming/header/h"
-    mkdir -p "$UVC_FUNC/streaming/class/fs"
-    mkdir -p "$UVC_FUNC/streaming/class/hs"
-    safe_link ../../uncompressed/u "$UVC_FUNC/streaming/header/h/u"
-    safe_link ../../mjpeg/m "$UVC_FUNC/streaming/header/h/m"
-    safe_link ../../header/h "$UVC_FUNC/streaming/class/fs/h"
-    safe_link ../../header/h "$UVC_FUNC/streaming/class/hs/h"
+    mkdir -p "$UVC_FUNC/streaming/class" || return 1
+    STREAMING_HEADER_NODE=$(create_streaming_header_links "$UVC_FUNC/streaming") || return 1
+    link_uvc_class "$UVC_FUNC/streaming" fs "$STREAMING_HEADER_NODE" || return 1
+    link_uvc_class "$UVC_FUNC/streaming" hs "$STREAMING_HEADER_NODE" || return 1
+    link_uvc_class "$UVC_FUNC/streaming" ss "$STREAMING_HEADER_NODE" || return 1
 
     # Link function to config
-    safe_link ../../functions/$UVC_FUNC_NAME "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME"
+    if ! safe_link "$UVC_FUNC" "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME"; then
+        printf "FAILED: cannot link function into config\n"
+        ls -ld "$GADGET_DIR" 2>&1 | sed 's/^/  /'
+        ls -ld "$GADGET_DIR/configs" "$GADGET_DIR/configs/c.1" 2>&1 | sed 's/^/  /'
+        ls -ld "$GADGET_DIR/functions" "$UVC_FUNC" 2>&1 | sed 's/^/  /'
+        return 1
+    fi
 
     # Enable gadget
-    UDC=$(ls "$UDC_UDC_DIR" 2>/dev/null | head -1)
+    UDC=$(ls "$UDC_DIR" 2>/dev/null | head -1)
     if [ -n "$UDC" ]; then
         echo "$UDC" > "$GADGET_DIR/UDC"
         printf "done (UDC: %s)\n" "$UDC"
@@ -178,12 +330,18 @@ start() {
     fi
 
     # Launch uvc-gadget (bridge camera to UVC function)
-    printf "Starting uvc-gadget... "
-    uvc-gadget -d "$VIDEO_DEV" "g1/functions/$UVC_FUNC_NAME" &
+    if [ "$USE_TEST_SOURCE" -eq 1 ]; then
+        printf "Starting uvc-gadget (source: test pattern)... "
+        uvc-gadget "g1/functions/$UVC_FUNC_NAME" &
+    else
+        printf "Starting uvc-gadget (source: %s)... " "$CAMERA_DEV"
+        uvc-gadget -d "$CAMERA_DEV" "g1/functions/$UVC_FUNC_NAME" &
+    fi
     printf "pid %d\n" $!
     return 0
 }
 
+# stop - kill uvc-gadget and dismantle the UVC gadget.
 stop() {
     printf "Stopping uvc-gadget... "
     killall uvc-gadget 2>/dev/null
@@ -194,10 +352,25 @@ stop() {
     printf "done\n"
 }
 
+# restart - stop then start the gadget.
 restart() {
     stop
     sleep 1
     start
+}
+
+# status - report whether the gadget is bound to a UDC and if uvc-gadget runs.
+status() {
+    if [ -d "$GADGET_DIR" ] && [ -n "$(cat "$GADGET_DIR/UDC" 2>/dev/null)" ]; then
+        log "UVC gadget bound to UDC: $(cat "$GADGET_DIR/UDC" 2>/dev/null)"
+    else
+        log "UVC gadget not bound"
+    fi
+    if pidof uvc-gadget >/dev/null 2>&1; then
+        log "uvc-gadget running (pid $(pidof uvc-gadget))"
+    else
+        log "uvc-gadget not running"
+    fi
 }
 
 case "$1" in
@@ -210,8 +383,11 @@ case "$1" in
     restart|reload)
         restart
         ;;
+    status)
+        status
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart}"
+        echo "Usage: $0 {start|stop|restart|status}"
         exit 1
         ;;
 esac

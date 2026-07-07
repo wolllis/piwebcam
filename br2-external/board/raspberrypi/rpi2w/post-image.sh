@@ -11,9 +11,19 @@ BOARD_NAME="$(basename "${BOARD_DIR}")"
 GENIMAGE_TMP="${BUILD_DIR}/genimage.tmp"
 
 # Copy firmware files to BINARIES_DIR root so they land at the root
-# of the FAT partition (where the Pi firmware expects them)
-cp "${BINARIES_DIR}/rpi-firmware/config.txt" "${BINARIES_DIR}/config.txt"
-cp "${BINARIES_DIR}/rpi-firmware/cmdline.txt" "${BINARIES_DIR}/cmdline.txt"
+# of the FAT partition (where the Pi firmware expects them).
+# Prefer board-specific config/cmdline so local changes are always reflected.
+if [ -f "${BOARD_DIR}/config.txt" ]; then
+    cp "${BOARD_DIR}/config.txt" "${BINARIES_DIR}/config.txt"
+else
+    cp "${BINARIES_DIR}/rpi-firmware/config.txt" "${BINARIES_DIR}/config.txt"
+fi
+
+if [ -f "${BOARD_DIR}/cmdline.txt" ]; then
+    cp "${BOARD_DIR}/cmdline.txt" "${BINARIES_DIR}/cmdline.txt"
+else
+    cp "${BINARIES_DIR}/rpi-firmware/cmdline.txt" "${BINARIES_DIR}/cmdline.txt"
+fi
 cp "${BINARIES_DIR}/rpi-firmware/start.elf" "${BINARIES_DIR}/start.elf"
 cp "${BINARIES_DIR}/rpi-firmware/fixup.dat" "${BINARIES_DIR}/fixup.dat"
 cp "${BINARIES_DIR}/rpi-firmware/bootcode.bin" "${BINARIES_DIR}/bootcode.bin"
