@@ -5,103 +5,133 @@ Build a minimal Buildroot-based Linux image for a Raspberry Pi that boots, captu
 
 ## Architecture & Key Decisions
 
-- **Target board**: Raspberry Pi Zero 2 W (RP3A0/BCM2837, quad Cortex-A53, 512MB RAM)
-- **Build system**: Buildroot 2026.05 from scratch on x86_64 host
-- **Init system**: BusyBox init (minimal footprint)
-- **C library**: glibc (Bootlin external toolchain) — switched from musl
-- **Kernel**: Raspberry Pi fork (bcm2709_defconfig + custom fragment) via github tarball
-- **Camera pipeline**: Direct V4L2 (kernel bcm2835-unicam + imx477 driver) → uvc-gadget → UVC function → USB host. No libcamera — fewer dependencies, more robust on limited hardware.
-- **Userspace**: `uvc-gadget` (reference tool from freedesktop.org) to bridge camera frames to UVC function
+- **Target board**: Raspberry Pi Zero 2 W (BCM2710A1/RP3A0, quad Cortex-A53, 512MB RAM)
+- **Build system**: Buildroot 2026.08-git, br2-external in `br2-external/`, build in `buildroot/`
+- **Build command**: `make -C buildroot BR2_EXTERNAL=../br2-external`
+- **Init system**: BusyBox init (minimal footprint), mdev for device management
+- **C library**: glibc — Bootlin armv7-eabihf bleeding-edge toolchain (headers 5.15, required by libcamera-apps ≥5.5)
+- **Kernel**: RPi Linux fork, `bcm2709_defconfig` + custom fragment, kernel 6.12.61-v7
+- **Camera pipeline**: IMX477 (CSI-2) → `bcm2835-unicam-legacy` → libcamera RPi/vc4 pipeline → `bcm2835-isp` → `rpicam-vid` → `v4l2loopback /dev/video10` → `uvc-gadget` → USB UVC
+- **Userspace tools**: `rpicam-vid` (libcamera-apps v1.7.0), `uvc-gadget` (peterbay fork), `v4l2loopback`
 
 ## Steps
 
 ### Phase 1: Project Scaffolding ✅
 
-1. **Create project directory structure** inside `/home/martin/raspberry_pi/`: a br2-external tree with board support files ✅
-   - `br2-external/` root with `external.desc`, `Config.in`, `external.mk`
+1. **Create br2-external tree** ✅
+   - `br2-external/` with `external.desc` (name: RPI2W_WEBCAM), `Config.in`, `external.mk`
    - `br2-external/configs/rpi2w_webcam_defconfig`
-   - `br2-external/board/raspberrypi/rpi2w/` with kernel config fragment, rootfs overlay, post-image script, init scripts
+   - `br2-external/board/raspberrypi/rpi2w/` — kernel fragment, rootfs overlay, post-image script
 
-2. **Clone Buildroot** into `buildroot/` subdirectory — use git tag `2026.05` ✅
+2. **Buildroot** cloned into `buildroot/` ✅
 
 ### Phase 2: Buildroot Configuration ✅
 
-3. **Target architecture**: `BR2_arm=y`, `BR2_cortex_a53=y`, Bootlin glibc external toolchain ✅
+3. **Toolchain**: Bootlin armv7-eabihf glibc bleeding-edge (headers 5.15) ✅
+   - Stable toolchain (headers 5.4) was tried first but failed — libcamera-apps requires ≥5.5
 
-4. **Kernel**: RPi fork, bcm2709_defconfig + fragment ✅
-   - Kernel config enables: `CONFIG_USB_CONFIGFS`, `CONFIG_USB_CONFIGFS_F_UVC`, `CONFIG_USB_DWC2=y`, `CONFIG_USB_DWC2_DUAL_ROLE=y`, `CONFIG_CMA_SIZE_MBYTES=256`, `CONFIG_I2C_BCM2835=y`, `CONFIG_PWM_BCM2835=y`
-   - `bcm2835-unicam` and `imx477` built as modules (=m) — loaded at boot by init script
-   - `dwc_otg` (Pi proprietary host driver) kept enabled alongside `dwc2` — boot-time overlay swaps to dwc2 for peripheral mode
+4. **Kernel**: RPi fork, `bcm2709_defconfig` + fragment ✅
+   - Fragment adds: `USB_GADGET=y`, `USB_CONFIGFS_F_UVC=y`, `USB_DWC2=y`, `USB_DWC2_DUAL_ROLE=y`, `I2C_BCM2835=y`, `PWM_BCM2835=y`, `REGULATOR=y`, `REGULATOR_FIXED_VOLTAGE=y`, `CMA_SIZE_MBYTES=256`
+   - `I2C_MUX_PINCTRL=m` — needed for camera I2C bus (i2c0mux), loaded explicitly in init script
+   - Camera drivers as modules: `bcm2835-unicam-legacy`, `imx477`, `bcm2835-isp`, `v4l2loopback`
+   - USB gadget built-in: `USB_GADGET=y`, `USB_LIBCOMPOSITE=y`, `USB_F_UVC=y`, `USB_DWC2=y`
 
-5. **Bootloader**: Raspberry Pi firmware (`BR2_PACKAGE_RPI_FIRMWARE=y`) ✅
+5. **Packages**: `libcamera` (RPi/vc4 pipeline), `libcamera-apps`, `v4l2loopback`, `libv4l`, `libv4l-utils`, `rpi-firmware` ✅
 
-6. **Filesystem**: ext4 ~120MB ✅
+6. **uvc-gadget**: peterbay fork in `br2-external/package/uvc-gadget/` ✅
 
-7. **Essential packages**: uvc-gadget (v0.3.0, br2-external), libevent ✅
+7. **Filesystem**: ext4 256MB ✅
 
 ### Phase 3: Camera + UVC Integration ✅
 
-8. **config.txt**: Enables camera, CMA=256, dwc2 overlay with dr_mode=peripheral, disable-bt for UART serial ✅
+8. **config.txt** (`br2-external/board/raspberrypi/rpi2w/config.txt`):
+   ```
+   start_file=start.elf
+   fixup_file=fixup.dat
+   kernel=zImage
+   gpu_mem_512=128
+   dtoverlay=imx477
+   dtoverlay=dwc2,dr_mode=peripheral
+   dtoverlay=disable-bt
+   dtoverlay=disable-wifi
+   enable_uart=1
+   ```
+   - `start.elf` only — `start_x.elf` hangs; `camera_auto_detect=1` also hangs
+   - `dtoverlay=imx477` (no `cam0` — Pi Zero 2 W camera connector is CSI1, the overlay's default)
 
-9. **Init script** (`S99uvc-webcam`): At boot, loads camera modules, waits for /dev/video0, configures UVC gadget via configfs, then runs `uvc-gadget` to bridge camera frames to UVC function ✅
+9. **Init script** (`S99uvc-webcam`) — 5-stage pipeline:
+   - Stage 1: load modules (`i2c-mux-pinctrl`, `bcm2835-unicam-legacy`, `imx477`, `bcm2835-isp`, `v4l2loopback`)
+   - Stage 2: wait for V4L2 subdev (sensor bind)
+   - Stage 3: launch `rpicam-vid --codec mjpeg -o /dev/video10`
+   - Stage 4: configure UVC gadget via configfs
+   - Stage 5: start `uvc-gadget` bridging `/dev/video10` → UVC
 
-10. **Rootfs overlay**: config.txt, cmdline.txt, S99uvc-webcam ✅
+10. **post-image.sh**: Assembles `boot.vfat` + `sdcard.img`; injects overlays from rpi-firmware into FAT via mtools ✅
 
-### Phase 4: Build & Validation
+### Phase 4: Build & Debugging ✅ (build complete, hardware debugging in progress)
 
-11. **Initial build**: ✅ Completed (serial works, root login works)
+11. **Build**: `make -C buildroot BR2_EXTERNAL=../br2-external` ✅ — all binaries present: `rpicam-vid` (114K), `uvc-gadget` (57K), `v4l2loopback.ko` (61K)
 
-12. **USB gadget debugging**: 🔄 IN PROGRESS
-    - Problem: `dwc_otg` (host-only driver) claims USB hardware, preventing gadget mode
-    - First fix: Disabled dwc_otg → kernel had no USB driver at all (broke everything)
-    - **Current approach**: Both dwc_otg (host) and dwc2 (dual-role) built-in. `dtoverlay=dwc2,dr_mode=peripheral` in config.txt swaps driver at boot.
-    - Overlays now copied to FAT partition by post-image.sh (fixes dtoverlay loading)
-    - Kernel built with correct config (CONFIG_USB_DWCOTG=y + CONFIG_USB_DWC2=y + CONFIG_USB_DWC2_DUAL_ROLE=y)
-    - **Needs testing**: flash image, verify dmesg for dwc2 bind, UDC detection, /dev/video*, host enumeration
+12. **Hardware debugging** (all resolved):
 
-13. **Test**: Flash `sdcard.img` to SD card, boot Pi, connect USB OTG to host PC. Verify `lsusb` shows UVC device.
+    | # | Symptom | Root cause | Fix |
+    |---|---------|-----------|-----|
+    | 1 | `rpicam-vid` missing | Stable toolchain headers 5.4 < 5.5 required by libcamera-apps | Switch to bleeding-edge toolchain (headers 5.15) |
+    | 2 | `start_x.elf` hangs | Incompatible with our firmware+kernel combo | Use `start.elf` only |
+    | 3 | `camera_auto_detect=1` hangs | Firmware autodetect incompatible | Use explicit `dtoverlay=imx477` |
+    | 4 | `bcm2835-unicam` (new) doesn't bind | Driver `unicam` doesn't match DT node with imx477 overlay | Use `bcm2835-unicam-legacy` instead |
+    | 5 | imx477 loads but sensor not found (no I2C device) | `i2c-mux-pinctrl.ko` never loaded — mdev has no modalias rule; without it `i2c0mux` has no driver and `i2c@1` (i2c_csi_dsi) is never created | Add `modprobe i2c-mux-pinctrl` as first camera module in init script |
+    | 6 | `rpicam-vid` crashes: "Overwriting Request::controls() is not allowed" | `controls_` in `rpicam_app.cpp` initialized with global `controls::controls` infoMap; libcamera v0.7.1 `Camera::queueRequest()` checks that `request->controls().infoMap() == &camera_->controls()` — they never match | Patch: reinitialize `controls_` with `libcamera::ControlList(camera_->controls())` after `camera_->acquire()`. Patch in `br2-external/patches/libcamera-apps/0001-fix-controls-infomap-mismatch.patch`, applied via `BR2_GLOBAL_PATCH_DIR` |
+    | 7 | UVC gadget setup fails: `streaming/class/fs/h` symlink fails | `create_streaming_header_links` called in `$(...)` subshell; `_log→printf` writes to stdout, so INFO lines were captured into `$hdr` alongside `header/h`; `header_path` became garbage | Replace echo/`$()` pattern with global `_HEADER_NODE` variable — no subshell |
+
+### Phase 5: End-to-end Validation 🔄 IN PROGRESS
+
+13. **Full pipeline confirmed working** on hardware (`/tmp/webcam.log` — boot T+21s):
+    - Stage 1 ✅ — all modules loaded (i2c-mux-pinctrl, bcm2835-unicam-legacy, imx477, bcm2835-isp, v4l2loopback)
+    - Stage 2 ✅ — `v4l-subdev0: [imx477 10-001a]` present; subdev wait times out but libcamera finds it anyway
+    - Stage 3 ✅ — `rpicam-vid` (PID 446) streaming MJPEG 640×480@30 to `/dev/video10`
+    - Stage 4 ✅ — UVC gadget configured via configfs, bound to UDC `3f980000.usb`
+    - Stage 5 ✅ — `uvc-gadget` (PID 615) bridging `/dev/video10` → `/dev/video2` (UVC)
+
+14. **Host enumeration confirmed** ✅ — Windows sees the UVC device.
+
+15. **Current blocker — VS endpoint -61 (ENODATA)**:
+    - When host opens the webcam, kernel logs `uvc: VS request completed with status -61`
+    - uvc-gadget log is empty; error doesn't recover
+    - MMAL firmware timeout cascade after ~800s (secondary effect)
+    - Root cause not yet confirmed; need: uvc-gadget log, /dev/video10 format, /dev/video2 format, dmesg context
 
 ## Verification
 1. ✅ Build completes without errors
-2. ✅ SD card boots on Raspberry Pi (serial console working)
-3. ⬜ `lsusb` on Pi shows USB gadgets enumerated
-4. ⬜ On host PC: `lsusb` shows "Linux UVC gadget" or similar
-5. ⬜ Host can open the webcam in Chrome/Teams/`ffplay /dev/video0` — video streams from HQ Camera
+2. ✅ SD card boots (kernel 6.12.61-v7, serial console ttyAMA0 115200)
+3. ✅ All modules load (i2c-mux-pinctrl, bcm2835-unicam-legacy, imx477, bcm2835-isp, v4l2loopback)
+4. ✅ IMX477 sensor probes (`v4l-subdev0: [imx477 10-001a]`)
+5. ✅ libcamera detects camera (`/base/soc/i2c0mux/i2c@1/imx477@1a`, pipeline rpi/vc4)
+6. ✅ `rpicam-vid` starts and streams to `/dev/video10` (after controls_ infoMap fix)
+7. ✅ UVC gadget configured via configfs and bound to UDC `3f980000.usb`
+8. ✅ `uvc-gadget` running, bridging `/dev/video10` → `/dev/video2` (USB UVC device)
+9. ⬜ Host PC sees UVC webcam device (`lsusb`)
+10. ⬜ Video streams to host application
 
-## Known Issues
-### dwc_otg vs dwc2 conflict
-The Raspberry Pi kernel fork uses `dwc_otg` (proprietary host-only driver) which claims the USB controller before dwc2 can bind in peripheral mode. The `dtoverlay=dwc2,dr_mode=peripheral` in config.txt should swap the driver at boot. This works on standard Raspberry Pi OS but hasn't been verified with Buildroot.
+## Key Files
+| File | Purpose |
+|------|---------|
+| `br2-external/configs/rpi2w_webcam_defconfig` | Buildroot defconfig |
+| `br2-external/board/raspberrypi/rpi2w/linux.config` | Kernel config fragment |
+| `br2-external/board/raspberrypi/rpi2w/config.txt` | Pi firmware config |
+| `br2-external/board/raspberrypi/rpi2w/rootfs-overlay/etc/init.d/S99uvc-webcam` | Main init script |
+| `br2-external/board/raspberrypi/rpi2w/post-image.sh` | Image assembly |
+| `br2-external/package/uvc-gadget/uvc-gadget.mk` | peterbay uvc-gadget package |
+| `br2-external/patches/libcamera-apps/0001-fix-controls-infomap-mismatch.patch` | rpicam-apps ControlInfoMap fix |
 
-### UVC configfs class link semantics (resolved)
-On this kernel, UVC class paths such as `control/class/fs` and `streaming/class/fs|hs|ss` behave as directories in configfs, not replaceable symlink nodes. Attempting to remove them (`rm -rf`) can fail with "Operation not permitted" and linking directly to those paths can fail at runtime. The working layout is to create links inside those directories (`.../class/fs/h`, `.../class/hs/h`, `.../class/ss/h`) pointing to the header node.
-
-### Camera drivers as modules
-`bcm2835-unicam` and `imx477` are modules (=m) because MEDIA_SUPPORT=m forces them. They're loaded by S99uvc-webcam at boot. The `camera_auto_detect=1` in config.txt may not work without the firmware sensor autodetection path — the init script handles this explicitly.
-
-## Relevant files
-- `br2-external/configs/rpi2w_webcam_defconfig` — Buildroot defconfig
-- `br2-external/board/raspberrypi/rpi2w/linux.config` — kernel config fragment
-- `br2-external/board/raspberrypi/rpi2w/rootfs-overlay/etc/init.d/S99uvc-webcam` — UVC gadget init script
-- `br2-external/board/raspberrypi/rpi2w/rootfs-overlay/boot/config.txt` — Pi firmware config
-- `br2-external/board/raspberrypi/rpi2w/genimage.cfg` — SD card image generation
-- `br2-external/board/raspberrypi/rpi2w/post-image.sh` — post-image script for genimage
-
-## Decisions
-- Using **br2-external tree** to keep all customization outside Buildroot source
-- Using **BusyBox init** for minimal footprint
-- **libcamera** as optional — can fall back to direct V4L2 if libcamera is too heavy for Pi's 512MB RAM
-- UVC gadget configured via configfs at boot, not compiled into kernel defconfig
-- Camera sensor driver (IMX477) needs to be in kernel, plus bcm2835-unicam for CSI-2 capture
-- `dtoverlay=dwc2,dr_mode=peripheral` for USB gadget mode (instead of disabling dwc_otg in kernel config)
-- Overlays copied to FAT partition via mtools in post-image.sh (Buildroot's rpi-firmware post-install puts them in a subdirectory)
+## Known Constraints
+- `start_x.elf` hangs — use `start.elf` only
+- `camera_auto_detect=1` hangs — use explicit `dtoverlay=imx477`
+- `bcm2835-unicam` (new broadcom/ driver) doesn't bind with imx477 overlay — use `bcm2835-unicam-legacy`
+- `i2c-mux-pinctrl` must be loaded explicitly (mdev has no modalias rules)
+- libcamera v0.7.1 + rpicam-apps v1.7.0 have a ControlInfoMap mismatch bug (patched)
+- MJPEG encoding is software on Zero 2 W (no MMAL hardware encoder); 640×480@30fps should be feasible
 
 ## Further Considerations
-1. **Which exact Pi model?** "Raspberry Pi 2 W" is ambiguous. Options:
-   - **Raspberry Pi Zero 2 W** (RP3A0, Cortex-A53, 512MB RAM) — has OTG USB, can act as device
-   - **Raspberry Pi 2 Model B V1.2** (BCM2837, Cortex-A53, 1GB RAM) — has 4x USB ports via LAN9515 hub, OTG is on the SoC but may need microUSB OTG cable
-   
-   The Zero 2 W is better suited for a UVC gadget since it has a dedicated OTG microUSB port. The Pi 2 Model B's USB port goes through a hub/LAN chip which complicates gadget mode.
-
-2. **libcamera vs direct V4L2**: libcamera adds ~15MB and complexity. For webcam use, direct V4L2 with `uvc-gadget` may be simpler and smaller, using the kernel's bcm2835-unicam + imx477 driver directly.
-
-3. **Frame size**: Pi 2 / Zero 2 W has limited USB bandwidth. 720p@15fps MJPEG is realistic. 1080p may need significant tuning.
+- **Frame size**: 640×480@30fps MJPEG is the initial target. 720p is possible; 1080p may be too slow for SW encoding on the Zero 2 W's quad A53.
+- **USB bandwidth**: High-speed USB (480Mbps) supports MJPEG at 1080p; the bottleneck is SW encoding speed.

@@ -1,24 +1,22 @@
 ################################################################################
 #
-# uvc-gadget
+# uvc-gadget (peterbay fork - used by showmewebcam)
+# Provides -u <uvc-dev> -v <v4l2-dev> interface.
 #
 ################################################################################
 
-UVC_GADGET_VERSION = v0.3.0
-UVC_GADGET_SITE = git://git.ideasonboard.org/uvc-gadget.git
+UVC_GADGET_VERSION = e9a733fe5c4a7fcb48e963e8d994bc33d24d814e
+UVC_GADGET_SITE = https://github.com/peterbay/uvc-gadget.git
 UVC_GADGET_SITE_METHOD = git
-UVC_GADGET_LICENSE = LGPL-2.1+
+UVC_GADGET_LICENSE = GPL-2.0+
 UVC_GADGET_LICENSE_FILES = LICENSE
-UVC_GADGET_INSTALL_STAGING = YES
 
-# meson build system
-UVC_GADGET_SUPPORTS_IN_SOURCE_BUILD = NO
+define UVC_GADGET_BUILD_CMDS
+	$(MAKE) CC="$(TARGET_CC)" LD="$(TARGET_LD)" -C $(@D)
+endef
 
-# host-meson added automatically by meson-package infra
-UVC_GADGET_DEPENDENCIES = libevent
+define UVC_GADGET_INSTALL_TARGET_CMDS
+	$(INSTALL) -D -m 0755 $(@D)/uvc-gadget $(TARGET_DIR)/usr/bin/uvc-gadget
+endef
 
-# Disable -Werror since uvc-gadget v0.3.0 has a few harmless warnings
-# with newer GCC (unused return value, transposed calloc args)
-UVC_GADGET_CONF_OPTS = -Dwerror=false
-
-$(eval $(meson-package))
+$(eval $(generic-package))

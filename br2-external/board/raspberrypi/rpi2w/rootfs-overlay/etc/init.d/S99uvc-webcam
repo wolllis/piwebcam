@@ -1,67 +1,140 @@
 #!/bin/sh
 #
-# S99uvc-webcam - UVC gadget init script
-# Configures a USB UVC gadget via configfs and launches uvc-gadget to bridge
-# the IMX477 camera (or a test pattern) to the UVC function so the board
-# enumerates as a standard USB webcam on the host.
+# S99uvc-webcam — Pi Zero 2 W UVC webcam init script
+#
+# Pipeline:
+#   IMX477 (CSI-2)
+#     → bcm2835-unicam-legacy  (CSI-2 receiver, V4L2 capture)
+#     → libcamera RPi/vc4 pipeline  (orchestrates unicam + ISP)
+#     → bcm2835-isp  (VideoCore ISP M2M, Bayer in → MJPEG out)
+#     → rpicam-vid  (libcamera tool writing to v4l2loopback)
+#     → v4l2loopback /dev/video10  (virtual V4L2 camera)
+#     → uvc-gadget  (bridges loopback → USB UVC)
+#     → Host PC sees a standard USB webcam
+#
+# Note: bcm2835-unicam (broadcom/) registers the 'unicam' platform driver but
+#       does not bind to 3f801000.csi with dtoverlay=imx477.  Using the legacy
+#       driver (bcm2835/) until the root cause is identified.
 #
 
-# Configuration
-CAMERA_DEV=""
-USE_TEST_SOURCE=0
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# USB gadget identity
 GADGET_DIR="/sys/kernel/config/usb_gadget/g1"
+UDC_DIR="/sys/class/udc"
 UVC_FUNC_NAME=""
-VID="0x1d6b"    # Linux Foundation
-PID="0x0102"    # UVC gadget
+VID="0x1d6b"            # Linux Foundation
+PID="0x0102"            # UVC gadget
 SERIAL="0000000001"
 MANUFACTURER="Raspberry Pi Foundation"
 PRODUCT="RPi Zero 2 W UVC Webcam"
 CONFIG_STRING="UVC"
 MAX_SPEED="high-speed"
-UDC_DIR="/sys/class/udc"
 
-# Frame descriptors advertised to the host, one per line:
-#   "<format> <index> <width> <height> <maxframebuffer> <frameinterval>"
-# frameinterval is in 100 ns units (333333 = 30 fps).
+# Camera / loopback
+LOOPBACK_DEV="/dev/video10"
+LOOPBACK_NR=10
+RPICAM_WIDTH=640
+RPICAM_HEIGHT=480
+RPICAM_FPS=30
+
+# UVC frame descriptors advertised to the host:
+#   format  index  width  height  default_frame_interval_100ns
+# 333333 = 30 fps   400000 = 25 fps   666666 = 15 fps
 UVC_FRAMES="
-uncompressed 1 1920 1080 4147200 333333
-uncompressed 2 1280 720  1843200 333333
-mjpeg        1 1920 1080 4147200 333333
-mjpeg        2 1280 720  1843200 333333
+mjpeg 1  640   480  333333
+mjpeg 2  1280  720  333333
+mjpeg 3  1920  1080 666666
 "
 
-# log MESSAGE - print an informational message to stdout.
-log() {
-    printf '%s\n' "$*"
+# Log files (written in addition to stdout → serial console)
+LOG_FILE="/tmp/webcam.log"
+RPICAM_LOG="/tmp/rpicam-vid.log"
+UVC_GADGET_LOG="/tmp/uvc-gadget.log"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+_log() {
+    local ts level line
+    ts=$(date '+%T' 2>/dev/null || printf '%s' '--:--:--')
+    level="$1"; shift
+    line="$ts [$level] $*"
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >> "$LOG_FILE"
 }
 
-# warn MESSAGE - print a warning message to stdout.
-warn() {
-    printf 'WARN: %s\n' "$*"
+info()  { _log "INFO " "$*"; }
+ok()    { _log "OK   " "$*"; }
+warn()  { _log "WARN " "$*"; }
+error() { _log "ERROR" "$*"; }
+
+section() {
+    _log "     " ""
+    _log "─────" "── $* ──"
 }
 
-# safe_link SRC DST - (re)create symlink DST -> SRC, creating parent dirs and
-# removing any stale link first. Returns the ln exit status.
+# show_video_devices — log sysfs name and device node for all V4L2 devices
+show_video_devices() {
+    local sysdev node name
+    for sysdev in /sys/class/video4linux/*; do
+        [ -e "$sysdev" ] || continue
+        node="/dev/$(basename "$sysdev")"
+        name=$(cat "$sysdev/name" 2>/dev/null || printf '?')
+        info "  $(basename "$sysdev"): [$name]  $node"
+    done
+}
+
+# show_subdevs — log all V4L2 subdevices (sensors, CSI receivers, etc.)
+show_subdevs() {
+    local d
+    if ls /sys/class/v4l2-subdev/ 2>/dev/null | grep -q .; then
+        for d in /sys/class/v4l2-subdev/*; do
+            [ -e "$d" ] || continue
+            info "  $(basename "$d"): $(cat "$d/name" 2>/dev/null || printf '?')"
+        done
+    else
+        info "  (none)"
+    fi
+}
+
+# show_modules — log camera/USB related loaded modules
+show_modules() {
+    grep -E 'bcm2835|unicam|v4l2loop|uvc|libcomposite|isp|imx477' \
+        /proc/modules 2>/dev/null | awk '{printf "  %-32s size=%s\n", $1, $2}' \
+        || info "  (none)"
+}
+
+# ── configfs helpers ──────────────────────────────────────────────────────────
+
+# cfs_write PATH VALUE — write VALUE to configfs attribute, log result
+cfs_write() {
+    local path="$1" value="$2"
+    if printf '%s' "$value" > "$path" 2>/dev/null; then
+        info "  write $path = '$value'"
+    else
+        error "  FAILED write $path = '$value'"
+        return 1
+    fi
+}
+
+# safe_link SRC DST — (re)create symlink with logging
 safe_link() {
-    src="$1"
-    dst="$2"
-    parent_dir=$(dirname "$dst")
-    mkdir -p "$parent_dir" 2>/dev/null || true
+    local src="$1" dst="$2"
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
     rm -f "$dst"
-    ln -s "$src" "$dst"
+    if ln -s "$src" "$dst"; then
+        info "  link $dst -> $src"
+    else
+        error "  FAILED link $dst -> $src"
+        return 1
+    fi
 }
 
-# link_uvc_class CLASS_ROOT SPEED [HEADER_NODE] - link the speed-specific class
-# entry (e.g. control/class/fs) to the header node. Handles kernels where the
-# class entry is a directory (link inside it) or a replaceable symlink node.
+# link_uvc_class CLASS_ROOT SPEED [HEADER_NODE]
 link_uvc_class() {
-    class_root="$1"
-    speed="$2"
-    header_node="${3:-header/h}"
-    header_path="$class_root/$header_node"
-    class_entry="$class_root/class/$speed"
-
-    # Kernel layouts differ: class/<speed> may be a directory or a symlink node.
+    local class_root="$1" speed="$2" header_node="${3:-header/h}"
+    local header_path="$class_root/$header_node"
+    local class_entry="$class_root/class/$speed"
     if [ -d "$class_entry" ]; then
         safe_link "$header_path" "$class_entry/h"
     else
@@ -69,327 +142,550 @@ link_uvc_class() {
     fi
 }
 
-# create_streaming_header_links STREAM_ROOT - link the uncompressed (u) and
-# mjpeg (m) format descriptors under the streaming header. Prints the header
-# node path used ("header/h" or "header") and returns 0 on success.
+# _HEADER_NODE — set by create_streaming_header_links; read by caller.
+# Using a variable instead of echo+$() avoids stdout capture swallowing
+# the info/safe_link log lines that _log prints to stdout.
+_HEADER_NODE=""
+
+# create_streaming_header_links STREAM_ROOT — link format dirs under the
+# streaming header.  Sets _HEADER_NODE to the header node name used.
 create_streaming_header_links() {
-    stream_root="$1"
+    local stream_root="$1" linked=0
+    _HEADER_NODE=""
 
     mkdir -p "$stream_root/header/h" 2>/dev/null || true
     if [ -d "$stream_root/header/h" ]; then
-        safe_link "$stream_root/uncompressed/u" "$stream_root/header/h/u" || return 1
-        safe_link "$stream_root/mjpeg/m" "$stream_root/header/h/m" || return 1
-        echo "header/h"
+        if [ -d "$stream_root/uncompressed/u" ]; then
+            safe_link "$stream_root/uncompressed/u" "$stream_root/header/h/u" || return 1
+            linked=1
+        fi
+        if [ -d "$stream_root/mjpeg/m" ]; then
+            safe_link "$stream_root/mjpeg/m" "$stream_root/header/h/m" || return 1
+            linked=1
+        fi
+        [ "$linked" -eq 1 ] || { error "No format dirs found to link"; return 1; }
+        _HEADER_NODE="header/h"
         return 0
     fi
 
-    # Fallback for kernels where header itself is used as the link anchor.
+    # Fallback: some kernels use 'header' as the link anchor directly
     mkdir -p "$stream_root/header" || return 1
-    safe_link "$stream_root/uncompressed/u" "$stream_root/header/u" || return 1
-    safe_link "$stream_root/mjpeg/m" "$stream_root/header/m" || return 1
-    echo "header"
+    if [ -d "$stream_root/uncompressed/u" ]; then
+        safe_link "$stream_root/uncompressed/u" "$stream_root/header/u" || return 1
+        linked=1
+    fi
+    if [ -d "$stream_root/mjpeg/m" ]; then
+        safe_link "$stream_root/mjpeg/m" "$stream_root/header/m" || return 1
+        linked=1
+    fi
+    [ "$linked" -eq 1 ] || { error "No format dirs found to link (fallback)"; return 1; }
+    _HEADER_NODE="header"
     return 0
 }
 
-# teardown_gadget - fully dismantle the configfs gadget tree.
-# configfs does not allow unlinking attribute files, so the tree must be
-# removed in order: unbind the UDC, delete every symlink (function and class
-# links), then rmdir the directories deepest-first (attributes vanish with
-# their directory). This also recovers from stale state left by a prior boot.
 teardown_gadget() {
     [ -d "$GADGET_DIR" ] || return 0
-
-    # Unbind from the UDC (an empty write, not a zero-byte truncate).
-    echo "" > "$GADGET_DIR/UDC" 2>/dev/null || true
-
-    # Remove all symlinks (config function links + UVC class links).
+    info "Tearing down existing gadget state in $GADGET_DIR..."
+    printf '' > "$GADGET_DIR/UDC" 2>/dev/null || true
     find "$GADGET_DIR" -type l -exec rm -f {} + 2>/dev/null || true
-
-    # Remove directories deepest-first; attribute files disappear with them.
     find "$GADGET_DIR" -depth -type d -exec rmdir {} + 2>/dev/null || true
 }
 
-# create_uvc_function - create the UVC function directory, trying the naming
-# variants used by different kernels. Sets UVC_FUNC_NAME and returns 0 on
-# success, 1 if neither variant can be created.
 create_uvc_function() {
+    local name
     for name in uvc.usb0 uvc.0; do
         if mkdir -p "$GADGET_DIR/functions/$name" 2>/dev/null; then
             UVC_FUNC_NAME="$name"
+            info "UVC function directory created: $name"
             return 0
         fi
     done
     return 1
 }
 
-# detect_camera_dev - print the /dev/videoN capture node for the CSI camera.
-# Skips UVC gadget nodes; prefers a node whose name matches a known camera
-# (unicam/imx/bcm2835/camera), otherwise falls back to the first non-gadget
-# node. Prints the node path and returns 0 on success, 1 if none found.
-detect_camera_dev() {
-    fallback=""
-
+detect_uvc_dev() {
+    local udc sysdev node name
+    udc=$(ls "$UDC_DIR" 2>/dev/null | head -1)
+    [ -n "$udc" ] || return 1
     for sysdev in /sys/class/video4linux/video*; do
         [ -e "$sysdev" ] || continue
-
         node="/dev/$(basename "$sysdev")"
         [ -c "$node" ] || continue
-
-        name=""
-        [ -r "$sysdev/name" ] && name=$(cat "$sysdev/name" 2>/dev/null)
-
-        case "$name" in
-            *gadget*|*Gadget*|*uvc*|*UVC*)
-                continue
-                ;;
-            *unicam*|*Unicam*|*imx*|*IMX*|*bcm2835*|*camera*|*Camera*)
-                echo "$node"
-                return 0
-                ;;
-        esac
-
-        # Remember the first non-gadget node as a fallback.
-        [ -z "$fallback" ] && fallback="$node"
+        name=$(cat "$sysdev/name" 2>/dev/null)
+        [ "$name" = "$udc" ] && { printf '%s' "$node"; return 0; }
     done
-
-    if [ -n "$fallback" ]; then
-        echo "$fallback"
-        return 0
-    fi
-
     return 1
 }
 
-# start - load camera + gadget modules, detect the camera (or fall back to a
-# test pattern), build the UVC gadget in configfs, bind it to the UDC, and
-# launch uvc-gadget to stream frames to the host.
-start() {
-    if ! modprobe libcomposite >/dev/null 2>&1; then
-        warn "modprobe libcomposite failed"
-    fi
-    if ! modprobe usb_f_uvc >/dev/null 2>&1; then
-        warn "modprobe usb_f_uvc failed (may be auto-loaded with the function)"
-    fi
+# ── Stage 1: kernel modules ───────────────────────────────────────────────────
 
-    printf "Loading camera modules... "
-    # The IMX477 + unicam graph needs i2c-mux + V4L2 async dependencies first.
-    for dep in i2c-mux i2c-mux-pinctrl v4l2-fwnode v4l2-async; do
-        if modprobe "$dep" >/dev/null 2>&1; then
-            printf "%s OK " "$dep"
-        else
-            printf "%s SKIP " "$dep"
-        fi
-    done
-    if modprobe bcm2835-unicam >/dev/null 2>&1; then
-        printf "bcm2835-unicam OK "
+load_modules() {
+    section "Stage 1: Loading kernel modules"
+
+    info "USB gadget modules:"
+    if modprobe libcomposite 2>/tmp/modprobe.err; then
+        ok "  libcomposite"
     else
-        printf "bcm2835-unicam SKIP "
-        modprobe bcm2835-unicam 2>&1 | sed 's/^/  /'
+        warn "  libcomposite failed: $(cat /tmp/modprobe.err)"
     fi
-    if modprobe imx477 >/dev/null 2>&1; then
-        printf "imx477 OK\n"
+    if modprobe usb_f_uvc 2>/tmp/modprobe.err; then
+        ok "  usb_f_uvc"
     else
-        printf "imx477 SKIP\n"
-        modprobe imx477 2>&1 | sed 's/^/  /'
+        warn "  usb_f_uvc: $(cat /tmp/modprobe.err) (may auto-load)"
     fi
 
-    # Wait for camera device and pin the actual capture node before binding UVC.
-    printf "Waiting for camera..."
-    for i in $(seq 15); do
-        CAMERA_DEV=$(detect_camera_dev)
-        [ -n "$CAMERA_DEV" ] && break
-        sleep 1
-        printf "."
-    done
-    printf "\n"
+    info "Camera pipeline modules:"
 
-    if [ -z "$CAMERA_DEV" ]; then
-        printf "WARN: no non-gadget V4L2 camera node found via unicam/imx477 path\n"
-        printf "Trying legacy camera stack (bcm2835-v4l2)... "
-        if modprobe bcm2835-v4l2 >/dev/null 2>&1; then
-            printf "loaded\n"
-        else
-            printf "not available\n"
-        fi
-
-        printf "Waiting for legacy camera node..."
-        for i in $(seq 10); do
-            CAMERA_DEV=$(detect_camera_dev)
-            [ -n "$CAMERA_DEV" ] && break
-            sleep 1
-            printf "."
-        done
-        printf "\n"
-
-        if [ -z "$CAMERA_DEV" ]; then
-            printf "WARN: no non-gadget V4L2 camera node found, falling back to test source\n"
-            ls -l /sys/class/video4linux 2>&1 | sed 's/^/  /'
-            ls -l /sys/bus/i2c/devices 2>&1 | sed 's/^/  /'
-            USE_TEST_SOURCE=1
-        fi
-    fi
-
-    printf "Configuring UVC gadget... "
-
-    # Mount configfs if not mounted
-    mountpoint -q /sys/kernel/config || mount -t configfs configfs /sys/kernel/config
-
-    # Check if already configured (and actually bound)
-    if [ -d "$GADGET_DIR" ] && [ -n "$(cat "$GADGET_DIR/UDC" 2>/dev/null)" ]; then
-        printf "already configured\n"
-        return 0
-    fi
-
-    # Recover from stale/invalid gadget state left by previous failed boots
-    teardown_gadget
-
-    # Create gadget
-    mkdir -p "$GADGET_DIR"
-    mkdir -p "$GADGET_DIR/functions"
-    echo "$VID" > "$GADGET_DIR/idVendor"
-    echo "$PID" > "$GADGET_DIR/idProduct"
-    echo "$MAX_SPEED" > "$GADGET_DIR/max_speed"
-
-    # Serial number, manufacturer, product strings
-    mkdir -p "$GADGET_DIR/strings/0x409"
-    echo "$SERIAL" > "$GADGET_DIR/strings/0x409/serialnumber"
-    echo "$MANUFACTURER" > "$GADGET_DIR/strings/0x409/manufacturer"
-    echo "$PRODUCT" > "$GADGET_DIR/strings/0x409/product"
-
-    # Create config
-    mkdir -p "$GADGET_DIR/configs/c.1"
-    mkdir -p "$GADGET_DIR/configs/c.1/strings/0x409"
-    echo "$CONFIG_STRING" > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
-    echo 120 > "$GADGET_DIR/configs/c.1/MaxPower"
-
-    # Create UVC function (kernel naming differs across versions)
-    create_uvc_function || {
-        printf "FAILED: cannot create UVC function (tried uvc.usb0 and uvc.0)\n"
-        printf "HINT: usb_f_uvc may be unavailable for the running kernel\n"
-        printf "DEBUG: uname -r=%s\n" "$(uname -r)"
-        printf "DEBUG: module path /lib/modules/%s\n" "$(uname -r)"
-        ls -ld "/lib/modules/$(uname -r)" 2>&1 | sed 's/^/  /'
-        ls "/lib/modules/$(uname -r)/kernel/drivers/usb/gadget/function" 2>&1 | sed 's/^/  /'
-        return 1
-    }
-
-    # Configure UVC control descriptors
-    UVC_FUNC="$GADGET_DIR/functions/$UVC_FUNC_NAME"
-
-    mkdir -p "$UVC_FUNC/control/header/h" || return 1
-    mkdir -p "$UVC_FUNC/control/class" || return 1
-    link_uvc_class "$UVC_FUNC/control" fs || return 1
-    link_uvc_class "$UVC_FUNC/control" ss || return 1
-
-    # DWC2 on Pi Zero 2 W supports USB 2.0 (FS/HS), not SuperSpeed.
-    # 3072 = 3 packets/microframe (high-speed isochronous) for the bandwidth
-    # needed by 720p/1080p MJPEG; 1023 (full-speed) starves the endpoint and
-    # causes "VS request completed with status -61".
-    echo 3072 > "$UVC_FUNC/streaming_maxpacket"
-
-    # Configure UVC streaming descriptors (see UVC_FRAMES table above).
-    echo "$UVC_FRAMES" | while read -r fmt idx w h buf interval; do
-        [ -n "$fmt" ] || continue
-        case "$fmt" in
-            uncompressed) frame_dir="$UVC_FUNC/streaming/uncompressed/u/$idx" ;;
-            mjpeg)        frame_dir="$UVC_FUNC/streaming/mjpeg/m/$idx" ;;
-            *)            continue ;;
-        esac
-        mkdir -p "$frame_dir" || exit 1
-        echo "$w" > "$frame_dir/wWidth"
-        echo "$h" > "$frame_dir/wHeight"
-        echo "$buf" > "$frame_dir/dwMaxVideoFrameBufferSize"
-        echo "$interval" > "$frame_dir/dwDefaultFrameInterval"
-        echo "$interval" > "$frame_dir/dwFrameInterval"
-    done || return 1
-
-    # Header descriptors and class links
-    mkdir -p "$UVC_FUNC/streaming/class" || return 1
-    STREAMING_HEADER_NODE=$(create_streaming_header_links "$UVC_FUNC/streaming") || return 1
-    link_uvc_class "$UVC_FUNC/streaming" fs "$STREAMING_HEADER_NODE" || return 1
-    link_uvc_class "$UVC_FUNC/streaming" hs "$STREAMING_HEADER_NODE" || return 1
-    link_uvc_class "$UVC_FUNC/streaming" ss "$STREAMING_HEADER_NODE" || return 1
-
-    # Link function to config
-    if ! safe_link "$UVC_FUNC" "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME"; then
-        printf "FAILED: cannot link function into config\n"
-        ls -ld "$GADGET_DIR" 2>&1 | sed 's/^/  /'
-        ls -ld "$GADGET_DIR/configs" "$GADGET_DIR/configs/c.1" 2>&1 | sed 's/^/  /'
-        ls -ld "$GADGET_DIR/functions" "$UVC_FUNC" 2>&1 | sed 's/^/  /'
+    # The i2c0mux node (compatible="i2c-mux-pinctrl") sits between the BCM2835
+    # BSC0 hardware and the camera I2C channels.  It is disabled in the base DTB
+    # and enabled by dtoverlay=imx477.  Since mdev has no modalias rule, this
+    # module is not auto-loaded — without it i2c_csi_dsi (i2c@1, bus 10) never
+    # appears and imx477 has no I2C device to probe.
+    if modprobe i2c-mux-pinctrl 2>/tmp/modprobe.err; then
+        ok "  i2c-mux-pinctrl  (i2c_csi_dsi / camera I2C bus)"
+    else
+        error "  i2c-mux-pinctrl FAILED: $(cat /tmp/modprobe.err)"
+        info "  dmesg tail:"
+        dmesg 2>/dev/null | tail -5 | sed 's/^/    /'
         return 1
     fi
 
-    # Enable gadget
-    UDC=$(ls "$UDC_DIR" 2>/dev/null | head -1)
-    if [ -n "$UDC" ]; then
-        echo "$UDC" > "$GADGET_DIR/UDC"
-        printf "done (UDC: %s)\n" "$UDC"
+    # CSI-2 receiver.  bcm2835-unicam-legacy is in drivers/media/platform/bcm2835/
+    # and correctly binds to 3f801000.csi with the imx477 overlay DT.
+    # The new bcm2835-unicam (broadcom/) registers driver 'unicam' but does not
+    # bind — loading it first would block legacy from loading (same driver name).
+    if modprobe bcm2835-unicam-legacy 2>/tmp/modprobe.err; then
+        ok "  bcm2835-unicam-legacy"
     else
-        printf "FAILED: no UDC found\n"
+        error "  bcm2835-unicam-legacy FAILED: $(cat /tmp/modprobe.err)"
+        info "  dmesg tail:"
+        dmesg | tail -5 | sed 's/^/    /'
         return 1
     fi
 
-    # Launch uvc-gadget (bridge camera to UVC function)
-    if [ "$USE_TEST_SOURCE" -eq 1 ]; then
-        printf "Starting uvc-gadget (source: test pattern)... "
-        uvc-gadget "g1/functions/$UVC_FUNC_NAME" &
+    # IMX477 sensor driver — must load after unicam so the async subdev match works
+    if modprobe imx477 2>/tmp/modprobe.err; then
+        ok "  imx477"
     else
-        printf "Starting uvc-gadget (source: %s)... " "$CAMERA_DEV"
-        uvc-gadget -d "$CAMERA_DEV" "g1/functions/$UVC_FUNC_NAME" &
+        error "  imx477 FAILED: $(cat /tmp/modprobe.err)"
+        info "  dmesg tail:"
+        dmesg | tail -10 | sed 's/^/    /'
+        return 1
     fi
-    printf "pid %d\n" $!
+
+    # VideoCore ISP M2M device — Bayer in, YUV/MJPEG out
+    if modprobe bcm2835-isp 2>/tmp/modprobe.err; then
+        ok "  bcm2835-isp"
+    else
+        error "  bcm2835-isp FAILED: $(cat /tmp/modprobe.err)"
+        return 1
+    fi
+
+    # Virtual V4L2 camera: rpicam-vid writes MJPEG frames here;
+    # uvc-gadget reads them.  exclusive_caps=1 prevents opens before a writer
+    # connects so uvc-gadget gets correct format capabilities.
+    if modprobe v4l2loopback \
+            video_nr="$LOOPBACK_NR" \
+            card_label="PiWebcam" \
+            exclusive_caps=1 2>/tmp/modprobe.err; then
+        ok "  v4l2loopback  (video_nr=$LOOPBACK_NR)"
+    else
+        error "  v4l2loopback FAILED: $(cat /tmp/modprobe.err)"
+        return 1
+    fi
+
+    info "Loaded camera/USB modules:"
+    show_modules
+
+    info "Video devices after module load:"
+    show_video_devices
+
+    info "V4L2 subdevices:"
+    show_subdevs
+
     return 0
 }
 
-# stop - kill uvc-gadget and dismantle the UVC gadget.
-stop() {
-    printf "Stopping uvc-gadget... "
-    killall uvc-gadget 2>/dev/null
-    printf "done\n"
+# ── Stage 2: wait for sensor bind ─────────────────────────────────────────────
 
-    printf "Disabling UVC gadget... "
-    teardown_gadget
-    printf "done\n"
+wait_sensor() {
+    section "Stage 2: Waiting for IMX477 sensor bind"
+
+    # The V4L2 async framework binds the imx477 I2C driver to the unicam
+    # notifier.  This may take a second or two after module load.
+    local i
+    for i in $(seq 1 10); do
+        if ls /sys/class/v4l2-subdev/ 2>/dev/null | grep -q .; then
+            ok "Sensor subdev registered after ${i}s:"
+            show_subdevs
+            info "Video devices now:"
+            show_video_devices
+            return 0
+        fi
+        info "  ${i}s — no subdev yet, waiting..."
+        sleep 1
+    done
+
+    warn "No V4L2 subdev appeared after 10s"
+    info "Video devices:"
+    show_video_devices
+    info "I2C devices (looking for imx477 at *-001a):"
+    ls /sys/bus/i2c/devices/ 2>/dev/null | sed 's/^/  /' || true
+    info "dmesg tail:"
+    dmesg | tail -15 | sed 's/^/  /'
+    # Not fatal — libcamera may still find the camera
+    return 0
 }
 
-# restart - stop then start the gadget.
+# ── Stage 3: libcamera pipeline ───────────────────────────────────────────────
+
+start_pipeline() {
+    section "Stage 3: Starting libcamera pipeline"
+
+    # Extra settle time: V4L2 async bind and media controller registration
+    # need to complete before libcamera opens /dev/media* devices.
+    info "Waiting 2s for V4L2 async bind to fully settle..."
+    sleep 2
+
+    info "Launching rpicam-vid:"
+    info "  rpicam-vid --camera 0 -t 0 --codec mjpeg \\"
+    info "    --width $RPICAM_WIDTH --height $RPICAM_HEIGHT \\"
+    info "    --framerate $RPICAM_FPS -o $LOOPBACK_DEV"
+
+    : > "$RPICAM_LOG"
+    rpicam-vid \
+        --camera 0 \
+        -t 0 \
+        --codec mjpeg \
+        --width  "$RPICAM_WIDTH" \
+        --height "$RPICAM_HEIGHT" \
+        --framerate "$RPICAM_FPS" \
+        -o "$LOOPBACK_DEV" \
+        >>"$RPICAM_LOG" 2>&1 &
+    RPICAM_PID=$!
+    info "rpicam-vid PID: $RPICAM_PID"
+
+    # rpicam-vid opens v4l2loopback as a V4L2 output device and calls
+    # VIDIOC_S_FMT.  With exclusive_caps=1 on the loopback, v4l2-ctl
+    # --get-fmt-video succeeds only after the writer has set the format.
+    info "Waiting for rpicam-vid to connect to $LOOPBACK_DEV..."
+    local i stream_ok=0
+    for i in $(seq 1 25); do
+        sleep 1
+
+        if ! kill -0 "$RPICAM_PID" 2>/dev/null; then
+            error "rpicam-vid exited unexpectedly after ${i}s"
+            error "─── rpicam-vid log ─────────────────────────────────────"
+            sed 's/^/  /' "$RPICAM_LOG"
+            sed 's/^/  /' "$RPICAM_LOG" >> "$LOG_FILE"
+            error "────────────────────────────────────────────────────────"
+            info "dmesg tail (last 20 lines):"
+            dmesg | tail -20 | sed 's/^/  /'
+            info "Media devices:"
+            ls -la /dev/media* 2>/dev/null | sed 's/^/  /' || info "  (none)"
+            return 1
+        fi
+
+        if v4l2-ctl -d "$LOOPBACK_DEV" --get-fmt-video >/tmp/v4l2fmt.txt 2>&1; then
+            stream_ok=1
+            break
+        fi
+
+        # Every 5s dump a snippet of rpicam-vid log to show it is progressing
+        if [ $(( i % 5 )) -eq 0 ]; then
+            info "  ${i}s — still waiting; rpicam-vid log tail:"
+            tail -5 "$RPICAM_LOG" | sed 's/^/    /'
+        else
+            info "  ${i}s — waiting..."
+        fi
+    done
+
+    if [ "$stream_ok" -eq 1 ]; then
+        ok "Camera pipeline active after ${i}s"
+        info "Loopback ($LOOPBACK_DEV) format:"
+        sed 's/^/  /' /tmp/v4l2fmt.txt
+        info "rpicam-vid log (first 20 lines):"
+        head -20 "$RPICAM_LOG" | sed 's/^/  /'
+        return 0
+    fi
+
+    error "Timeout: loopback has no format after 25s"
+    error "─── rpicam-vid log ─────────────────────────────────────"
+    sed 's/^/  /' "$RPICAM_LOG"
+    sed 's/^/  /' "$RPICAM_LOG" >> "$LOG_FILE"
+    error "────────────────────────────────────────────────────────"
+    return 1
+}
+
+# ── Stage 4: UVC gadget setup ─────────────────────────────────────────────────
+
+setup_gadget() {
+    section "Stage 4: Configuring UVC gadget (configfs)"
+
+    mountpoint -q /sys/kernel/config || {
+        info "Mounting configfs..."
+        mount -t configfs configfs /sys/kernel/config
+    }
+
+    if [ -d "$GADGET_DIR" ] && [ -n "$(cat "$GADGET_DIR/UDC" 2>/dev/null)" ]; then
+        info "Gadget already bound to: $(cat "$GADGET_DIR/UDC")"
+        return 0
+    fi
+
+    teardown_gadget
+
+    info "Creating gadget tree at $GADGET_DIR..."
+    mkdir -p "$GADGET_DIR/functions" || return 1
+
+    cfs_write "$GADGET_DIR/idVendor"  "$VID"       || return 1
+    cfs_write "$GADGET_DIR/idProduct" "$PID"       || return 1
+    cfs_write "$GADGET_DIR/max_speed" "$MAX_SPEED" || return 1
+
+    mkdir -p "$GADGET_DIR/strings/0x409"
+    cfs_write "$GADGET_DIR/strings/0x409/serialnumber" "$SERIAL"       || return 1
+    cfs_write "$GADGET_DIR/strings/0x409/manufacturer" "$MANUFACTURER" || return 1
+    cfs_write "$GADGET_DIR/strings/0x409/product"      "$PRODUCT"      || return 1
+
+    mkdir -p "$GADGET_DIR/configs/c.1/strings/0x409"
+    cfs_write "$GADGET_DIR/configs/c.1/strings/0x409/configuration" \
+        "$CONFIG_STRING" || return 1
+    cfs_write "$GADGET_DIR/configs/c.1/MaxPower" "120" || return 1
+
+    create_uvc_function || {
+        error "Cannot create UVC function (tried uvc.usb0 and uvc.0)"
+        info "USB gadget function modules in kernel:"
+        ls "/lib/modules/$(uname -r)/kernel/drivers/usb/gadget/function/" \
+            2>/dev/null | sed 's/^/  /' || true
+        return 1
+    }
+
+    local UVC_FUNC="$GADGET_DIR/functions/$UVC_FUNC_NAME"
+
+    info "Control interface:"
+    mkdir -p "$UVC_FUNC/control/header/h" || return 1
+    mkdir -p "$UVC_FUNC/control/class"    || return 1
+    link_uvc_class "$UVC_FUNC/control" fs || return 1
+    link_uvc_class "$UVC_FUNC/control" ss || return 1
+
+    # 1024 bytes/microframe: DWC2 on Pi Zero 2 W is USB 2.0 HS only
+    cfs_write "$UVC_FUNC/streaming_maxpacket" "1024" || return 1
+
+    info "Streaming interface (frame descriptors):"
+    # Write UVC_FRAMES to a temp file to avoid subshell/return issues
+    # that arise when driving the while loop through a pipe.
+    printf '%s\n' "$UVC_FRAMES" > /tmp/uvc_frames.tmp
+    local frame_ok=1
+    while read -r fmt idx w h interval; do
+        [ -n "$fmt" ] || continue
+        local frame_dir
+        case "$fmt" in
+            uncompressed) frame_dir="$UVC_FUNC/streaming/uncompressed/u/$idx" ;;
+            mjpeg)        frame_dir="$UVC_FUNC/streaming/mjpeg/m/$idx" ;;
+            *) continue ;;
+        esac
+        info "  [$idx] $fmt  ${w}x${h}  interval=$interval"
+        mkdir -p "$frame_dir" || { frame_ok=0; break; }
+        local buf=$((w * h * 2))
+        printf '%s' "$w"                    > "$frame_dir/wWidth"
+        printf '%s' "$h"                    > "$frame_dir/wHeight"
+        printf '%s' "$buf"                  > "$frame_dir/dwMaxVideoFrameBufferSize"
+        printf '%s' "$((w * h * 8 * 10))"  > "$frame_dir/dwMinBitRate"
+        printf '%s' "$((w * h * 8 * 30))"  > "$frame_dir/dwMaxBitRate"
+        printf '%s' "$interval"             > "$frame_dir/dwDefaultFrameInterval"
+        printf '%s\n' "$interval" "400000" "666666" > "$frame_dir/dwFrameInterval"
+    done < /tmp/uvc_frames.tmp
+    [ "$frame_ok" -eq 1 ] || { error "Frame descriptor setup failed"; return 1; }
+
+    info "Header / class links:"
+    mkdir -p "$UVC_FUNC/streaming/class" || return 1
+    create_streaming_header_links "$UVC_FUNC/streaming" || return 1
+    info "  Streaming header node: $_HEADER_NODE"
+    link_uvc_class "$UVC_FUNC/streaming" fs "$_HEADER_NODE" || return 1
+    link_uvc_class "$UVC_FUNC/streaming" hs "$_HEADER_NODE" || return 1
+    link_uvc_class "$UVC_FUNC/streaming" ss "$_HEADER_NODE" || return 1
+
+    safe_link "$UVC_FUNC" "$GADGET_DIR/configs/c.1/$UVC_FUNC_NAME" || return 1
+
+    info "Binding to UDC..."
+    local UDC
+    UDC=$(ls "$UDC_DIR" 2>/dev/null | head -1)
+    if [ -z "$UDC" ]; then
+        error "No UDC found in $UDC_DIR"
+        info "ls $UDC_DIR: $(ls "$UDC_DIR" 2>/dev/null || echo none)"
+        return 1
+    fi
+    cfs_write "$GADGET_DIR/UDC" "$UDC" || return 1
+    ok "Gadget bound to UDC: $UDC"
+    return 0
+}
+
+# ── Stage 5: uvc-gadget bridge ────────────────────────────────────────────────
+
+launch_bridge() {
+    section "Stage 5: Launching uvc-gadget bridge"
+
+    info "Waiting for UVC gadget video device (sysfs name = UDC name)..."
+    local uvc_dev i
+    for i in $(seq 1 10); do
+        uvc_dev=$(detect_uvc_dev)
+        [ -n "$uvc_dev" ] && break
+        info "  ${i}s — waiting..."
+        sleep 1
+    done
+
+    if [ -z "$uvc_dev" ]; then
+        error "UVC gadget video device not found after 10s"
+        info "Video devices currently:"
+        show_video_devices
+        info "UDC: $(cat "$GADGET_DIR/UDC" 2>/dev/null || echo '(unbound)')"
+        return 1
+    fi
+    ok "UVC gadget video device: $uvc_dev"
+
+    info "Launching: uvc-gadget -u $uvc_dev -v $LOOPBACK_DEV"
+    : > "$UVC_GADGET_LOG"
+    uvc-gadget -u "$uvc_dev" -v "$LOOPBACK_DEV" >>"$UVC_GADGET_LOG" 2>&1 &
+    UVC_GADGET_PID=$!
+    info "uvc-gadget PID: $UVC_GADGET_PID"
+
+    sleep 1
+    if ! kill -0 "$UVC_GADGET_PID" 2>/dev/null; then
+        error "uvc-gadget exited immediately"
+        error "─── uvc-gadget log ─────────────────────────────────────"
+        sed 's/^/  /' "$UVC_GADGET_LOG"
+        sed 's/^/  /' "$UVC_GADGET_LOG" >> "$LOG_FILE"
+        error "────────────────────────────────────────────────────────"
+        return 1
+    fi
+    ok "uvc-gadget running (PID $UVC_GADGET_PID)"
+    info "Log: $UVC_GADGET_LOG"
+    return 0
+}
+
+# ── Main actions ──────────────────────────────────────────────────────────────
+
+start() {
+    : > "$LOG_FILE"
+    section "RPi Zero 2 W UVC Webcam — startup"
+    info "Kernel:  $(uname -r)"
+    info "Date:    $(date 2>/dev/null || echo '?')"
+    info "Uptime:  $(cut -d. -f1 /proc/uptime 2>/dev/null)s"
+    info "Memory:"
+    grep -E 'MemTotal|MemFree|MemAvail' /proc/meminfo | sed 's/^/  /'
+
+    # De-assert D+ pullup immediately so the host doesn't see a broken/unknown
+    # USB device during the ~30 s of module loading and pipeline startup.
+    # DWC2 will re-assert D+ automatically when the UVC gadget is bound to the
+    # UDC in setup_gadget() (usb_gadget_connect is called by the gadget bind).
+    local _udc
+    _udc=$(ls "$UDC_DIR" 2>/dev/null | head -1)
+    if [ -n "$_udc" ] && [ -f "$UDC_DIR/$_udc/soft_connect" ]; then
+        info "Soft-disconnecting UDC ($_udc) — host won't see device until gadget is ready"
+        echo 0 > "$UDC_DIR/$_udc/soft_connect" 2>/dev/null \
+            || warn "soft_connect write failed (kernel may not support it)"
+    else
+        warn "soft_connect not available — host may see unknown USB device during startup"
+    fi
+
+    load_modules   || { error "FATAL: module loading failed"; return 1; }
+    wait_sensor
+    start_pipeline || { error "FATAL: camera pipeline failed"; return 1; }
+    setup_gadget   || { error "FATAL: UVC gadget setup failed"; return 1; }
+    launch_bridge  || { error "FATAL: uvc-gadget bridge failed"; return 1; }
+
+    section "Startup complete"
+    ok "Pipeline:  IMX477 -> unicam-legacy -> bcm2835-isp -> rpicam-vid"
+    ok "Bridge:    $LOOPBACK_DEV -> uvc-gadget -> USB UVC"
+    ok "Full log:  $LOG_FILE"
+}
+
+stop() {
+    section "RPi Zero 2 W UVC Webcam — shutdown"
+
+    if pidof rpicam-vid >/dev/null 2>&1; then
+        killall rpicam-vid 2>/dev/null
+        ok "rpicam-vid stopped"
+    else
+        info "rpicam-vid was not running"
+    fi
+
+    if pidof uvc-gadget >/dev/null 2>&1; then
+        killall uvc-gadget 2>/dev/null
+        ok "uvc-gadget stopped"
+    else
+        info "uvc-gadget was not running"
+    fi
+
+    teardown_gadget
+    ok "UVC gadget dismantled"
+}
+
 restart() {
     stop
     sleep 1
     start
 }
 
-# status - report whether the gadget is bound to a UDC and if uvc-gadget runs.
 status() {
-    if [ -d "$GADGET_DIR" ] && [ -n "$(cat "$GADGET_DIR/UDC" 2>/dev/null)" ]; then
-        log "UVC gadget bound to UDC: $(cat "$GADGET_DIR/UDC" 2>/dev/null)"
+    section "UVC Webcam status"
+
+    info "Kernel modules (camera/USB):"
+    show_modules
+
+    info "Video devices:"
+    show_video_devices
+
+    info "V4L2 subdevices:"
+    show_subdevs
+
+    info "UDC state:"
+    for udc in "$UDC_DIR"/*; do
+        [ -e "$udc" ] || continue
+        info "  $(basename "$udc")"
+    done
+
+    info "Gadget ($GADGET_DIR):"
+    if [ -d "$GADGET_DIR" ]; then
+        local udc_val
+        udc_val=$(cat "$GADGET_DIR/UDC" 2>/dev/null)
+        if [ -n "$udc_val" ]; then
+            ok "  Bound to: $udc_val"
+        else
+            warn "  Directory exists but not bound to any UDC"
+        fi
     else
-        log "UVC gadget not bound"
+        info "  Not configured"
+    fi
+
+    info "Processes:"
+    if pidof rpicam-vid >/dev/null 2>&1; then
+        ok "  rpicam-vid  RUNNING  PID=$(pidof rpicam-vid)"
+    else
+        warn "  rpicam-vid  NOT running"
     fi
     if pidof uvc-gadget >/dev/null 2>&1; then
-        log "uvc-gadget running (pid $(pidof uvc-gadget))"
+        ok "  uvc-gadget  RUNNING  PID=$(pidof uvc-gadget)"
     else
-        log "uvc-gadget not running"
+        warn "  uvc-gadget  NOT running"
+    fi
+
+    if [ -s "$RPICAM_LOG" ]; then
+        info "rpicam-vid log (last 15 lines from $RPICAM_LOG):"
+        tail -15 "$RPICAM_LOG" | sed 's/^/  /'
+    fi
+    if [ -s "$UVC_GADGET_LOG" ]; then
+        info "uvc-gadget log (last 15 lines from $UVC_GADGET_LOG):"
+        tail -15 "$UVC_GADGET_LOG" | sed 's/^/  /'
     fi
 }
 
 case "$1" in
-    start)
-        start
-        ;;
-    stop)
-        stop
-        ;;
-    restart|reload)
-        restart
-        ;;
-    status)
-        status
-        ;;
+    start)          start   ;;
+    stop)           stop    ;;
+    restart|reload) restart ;;
+    status)         status  ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status}"
+        printf 'Usage: %s {start|stop|restart|status}\n' "$0" >&2
         exit 1
         ;;
 esac
-
-exit $?
